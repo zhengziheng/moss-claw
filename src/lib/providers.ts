@@ -15,10 +15,11 @@ export const PROVIDER_TYPES = [
   'openrouter',
   'ark',
   'moonshot',
+  'moonshot-global',
   'siliconflow',
   'minimax-portal',
   'minimax-portal-cn',
-  'qwen-portal',
+  'modelstudio',
   'ollama',
   'custom',
 ] as const;
@@ -33,10 +34,11 @@ export const BUILTIN_PROVIDER_TYPES = [
   'openrouter',
   'ark',
   'moonshot',
+  'moonshot-global',
   'siliconflow',
   'minimax-portal',
   'minimax-portal-cn',
-  'qwen-portal',
+  'modelstudio',
   'ollama',
 ] as const;
 
@@ -48,6 +50,7 @@ export interface ProviderConfig {
   type: ProviderType;
   baseUrl?: string;
   apiProtocol?: 'openai-completions' | 'openai-responses' | 'anthropic-messages';
+  headers?: Record<string, string>;
   model?: string;
   fallbackModels?: string[];
   fallbackProviderIds?: string[];
@@ -79,6 +82,11 @@ export interface ProviderTypeInfo {
   apiKeyUrl?: string;
   docsUrl?: string;
   docsUrlZh?: string;
+  codePlanPresetBaseUrl?: string;
+  codePlanPresetModelId?: string;
+  codePlanDocsUrl?: string;
+  /** If true, this provider is not shown in the "Add Provider" dialog. */
+  hidden?: boolean;
 }
 
 export type ProviderAuthMode =
@@ -108,6 +116,7 @@ export interface ProviderAccount {
   authMode: ProviderAuthMode;
   baseUrl?: string;
   apiProtocol?: 'openai-completions' | 'openai-responses' | 'anthropic-messages';
+  headers?: Record<string, string>;
   model?: string;
   fallbackModels?: string[];
   fallbackAccountIds?: string[];
@@ -188,9 +197,13 @@ export function resolveProviderModelForSave(
   return trimmedModelId || provider?.defaultModelId || undefined;
 }
 
+export function normalizeProviderApiKeyInput(apiKey: string): string {
+  return apiKey.trim();
+}
+
 /** Normalize provider API key before saving; Ollama uses a local placeholder when blank. */
 export function resolveProviderApiKeyForSave(type: ProviderType | string, apiKey: string): string | undefined {
-  const trimmed = apiKey.trim();
+  const trimmed = normalizeProviderApiKeyInput(apiKey);
   if (type === 'ollama') {
     return trimmed || OLLAMA_PLACEHOLDER_API_KEY;
   }

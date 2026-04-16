@@ -19,8 +19,11 @@ import {
   saveProviderKeyToOpenClaw,
   removeProviderFromOpenClaw,
 } from '../utils/openclaw-auth';
+import { syncProxyConfigToOpenClaw } from '../utils/openclaw-proxy';
 import { buildOpenClawControlUiUrl } from '../utils/openclaw-control-ui';
 import { logger } from '../utils/logger';
+import { resolveAgentIdFromChannel } from '../utils/agent-config';
+import { resolveAccountIdFromSessionHistory } from '../utils/session-util';
 import {
   saveChannelConfig,
   getChannelConfig,
@@ -31,11 +34,11 @@ import {
   validateChannelConfig,
   validateChannelCredentials,
 } from '../utils/channel-config';
+import { toOpenClawChannelType, toUiChannelType } from '../utils/channel-alias';
 import { checkUvInstalled, installUv, setupManagedPython } from '../utils/uv-setup';
 import {
   ensureDingTalkPluginInstalled,
   ensureFeishuPluginInstalled,
-  ensureQQBotPluginInstalled,
   ensureWeComPluginInstalled,
 } from '../utils/plugin-install';
 import { updateSkillConfig, getSkillConfig, getAllSkillConfigs } from '../utils/skill-config';
@@ -59,27 +62,14 @@ import {
 } from '../services/providers/provider-runtime-sync';
 import { validateApiKeyWithProvider } from '../services/providers/provider-validation';
 import { appUpdater } from './updater';
-import { PORTS } from '../utils/config';
-
-type AppRequest = {
-  id?: string;
-  module: string;
-  action: string;
-  payload?: unknown;
-};
-
-type AppErrorCode = 'VALIDATION' | 'PERMISSION' | 'TIMEOUT' | 'GATEWAY' | 'INTERNAL' | 'UNSUPPORTED';
-
-type AppResponse = {
-  id?: string;
-  ok: boolean;
-  data?: unknown;
-  error?: {
-    code: AppErrorCode;
-    message: string;
-    details?: unknown;
-  };
-};
+import { registerHostApiProxyHandlers } from './ipc/host-api-proxy';
+import {
+  isLaunchAtStartupKey,
+  isProxyKey,
+  mapAppErrorCode,
+  type AppRequest,
+  type AppResponse,
+} from './ipc/request-helpers';
 
 /**
  * Register all IPC handlers
@@ -150,96 +140,11 @@ export function registerIpcHandlers(
   registerFileHandlers();
 }
 
-type HostApiFetchRequest = {
-  path: string;
-  method?: string;
-  headers?: Record<string, string>;
-  body?: unknown;
-};
-
-function registerHostApiProxyHandlers(): void {
-  ipcMain.handle('hostapi:fetch', async (_, request: HostApiFetchRequest) => {
-    try {
-      const path = typeof request?.path === 'string' ? request.path : '';
-      if (!path || !path.startsWith('/')) {
-        throw new Error(`Invalid host API path: ${String(request?.path)}`);
-      }
-
-      const method = (request.method || 'GET').toUpperCase();
-      const headers: Record<string, string> = { ...(request.headers || {}) };
-      let body: string | undefined;
-
-      if (request.body !== undefined && request.body !== null) {
-        if (typeof request.body === 'string') {
-          body = request.body;
-        } else {
-          body = JSON.stringify(request.body);
-          if (!headers['Content-Type'] && !headers['content-type']) {
-            headers['Content-Type'] = 'application/json';
-          }
-        }
-      }
-
-      const response = await proxyAwareFetch(`http://127.0.0.1:${PORTS.CLAWX_HOST_API}${path}`, {
-        method,
-        headers,
-        body,
-      });
-
-      const data: { status: number; ok: boolean; json?: unknown; text?: string } = {
-        status: response.status,
-        ok: response.ok,
-      };
-
-      if (response.status !== 204) {
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          data.json = await response.json().catch(() => undefined);
-        } else {
-          data.text = await response.text().catch(() => '');
-        }
-      }
-
-      return { ok: true, data };
-    } catch (error) {
-      return {
-        ok: false,
-        error: {
-          message: error instanceof Error ? error.message : String(error),
-        },
-      };
-    }
-  });
-}
-
-function mapAppErrorCode(error: unknown): AppErrorCode {
-  const msg = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  if (msg.includes('timeout')) return 'TIMEOUT';
-  if (msg.includes('permission') || msg.includes('denied') || msg.includes('forbidden')) return 'PERMISSION';
-  if (msg.includes('gateway')) return 'GATEWAY';
-  if (msg.includes('invalid') || msg.includes('required')) return 'VALIDATION';
-  return 'INTERNAL';
-}
-
-function isProxyKey(key: keyof AppSettings): boolean {
-  return (
-    key === 'proxyEnabled' ||
-    key === 'proxyServer' ||
-    key === 'proxyHttpServer' ||
-    key === 'proxyHttpsServer' ||
-    key === 'proxyAllServer' ||
-    key === 'proxyBypassRules'
-  );
-}
-
-function isLaunchAtStartupKey(key: keyof AppSettings): boolean {
-  return key === 'launchAtStartup';
-}
-
 function registerUnifiedRequestHandlers(gatewayManager: GatewayManager): void {
   const providerService = getProviderService();
   const handleProxySettingsChange = async () => {
     const settings = await getAllSettings();
+    await syncProxyConfigToOpenClaw(settings, { preserveExistingWhenDisabled: false });
     await applyProxySettings(settings);
     if (gatewayManager.getStatus().state === 'running') {
       await gatewayManager.restart();
@@ -591,7 +496,13 @@ function registerUnifiedRequestHandlers(gatewayManager: GatewayManager): void {
             break;
           }
           if (request.action === 'create') {
-            type CronCreateInput = { name: string; message: string; schedule: string; enabled?: boolean };
+            type CronCreateInput = {
+              name: string;
+              message: string;
+              schedule: string;
+              delivery?: { mode: string; channel?: string; to?: string };
+              enabled?: boolean;
+            };
             const payload = request.payload as
               | { input?: CronCreateInput }
               | [CronCreateInput]
@@ -613,8 +524,12 @@ function registerUnifiedRequestHandlers(gatewayManager: GatewayManager): void {
               enabled: input.enabled ?? true,
               wakeMode: 'next-heartbeat',
               sessionTarget: 'isolated',
-              delivery: { mode: 'none' },
+              delivery: normalizeCronDelivery(input.delivery),
             };
+            const unsupportedDeliveryError = getUnsupportedCronDeliveryError(gatewayInput.delivery.channel);
+            if (gatewayInput.delivery.mode === 'announce' && unsupportedDeliveryError) {
+              throw new Error(unsupportedDeliveryError);
+            }
             const created = await gatewayManager.rpc('cron.add', gatewayInput);
             data = created && typeof created === 'object' ? transformCronJob(created as GatewayCronJob) : created;
             break;
@@ -627,11 +542,19 @@ function registerUnifiedRequestHandlers(gatewayManager: GatewayManager): void {
             const id = Array.isArray(payload) ? payload[0] : payload?.id;
             const input = Array.isArray(payload) ? payload[1] : payload?.input;
             if (!id || !input) throw new Error('Invalid cron.update payload');
-            const patch = { ...input };
-            if (typeof patch.schedule === 'string') patch.schedule = { kind: 'cron', expr: patch.schedule };
-            if (typeof patch.message === 'string') {
-              patch.payload = { kind: 'agentTurn', message: patch.message };
-              delete patch.message;
+            const patch = buildCronUpdatePatch(input);
+            const deliveryPatch = patch.delivery && typeof patch.delivery === 'object'
+              ? patch.delivery as Record<string, unknown>
+              : undefined;
+            const deliveryChannel = typeof deliveryPatch?.channel === 'string' && deliveryPatch.channel.trim()
+              ? deliveryPatch.channel.trim()
+              : undefined;
+            const deliveryMode = typeof deliveryPatch?.mode === 'string' && deliveryPatch.mode.trim()
+              ? deliveryPatch.mode.trim()
+              : undefined;
+            const unsupportedDeliveryError = getUnsupportedCronDeliveryError(deliveryChannel);
+            if (unsupportedDeliveryError && deliveryMode !== 'none') {
+              throw new Error(unsupportedDeliveryError);
             }
             data = await gatewayManager.rpc('cron.update', { id, patch });
             break;
@@ -813,7 +736,7 @@ interface GatewayCronJob {
   updatedAtMs: number;
   schedule: { kind: string; expr?: string; everyMs?: number; at?: string; tz?: string };
   payload: { kind: string; message?: string; text?: string };
-  delivery?: { mode: string; channel?: string; to?: string };
+  delivery?: { mode: string; channel?: string; to?: string; accountId?: string };
   sessionTarget?: string;
   state: {
     nextRunAtMs?: number;
@@ -824,17 +747,108 @@ interface GatewayCronJob {
   };
 }
 
+type GatewayCronDelivery = NonNullable<GatewayCronJob['delivery']>;
+
+function getUnsupportedCronDeliveryError(_channel: string | undefined): string | null {
+  // Channel support is gated by the frontend whitelist (TESTED_CRON_DELIVERY_CHANNELS).
+  // No per-channel backend blocks are needed.
+  return null;
+}
+
+function normalizeCronDelivery(
+  rawDelivery: unknown,
+  fallbackMode: GatewayCronDelivery['mode'] = 'none',
+): GatewayCronDelivery {
+  if (!rawDelivery || typeof rawDelivery !== 'object') {
+    return { mode: fallbackMode };
+  }
+
+  const delivery = rawDelivery as Record<string, unknown>;
+  const mode = typeof delivery.mode === 'string' && delivery.mode.trim()
+    ? delivery.mode.trim()
+    : fallbackMode;
+  const channel = typeof delivery.channel === 'string' && delivery.channel.trim()
+    ? toOpenClawChannelType(delivery.channel.trim())
+    : undefined;
+  const to = typeof delivery.to === 'string' && delivery.to.trim()
+    ? delivery.to.trim()
+    : undefined;
+  const accountId = typeof delivery.accountId === 'string' && delivery.accountId.trim()
+    ? delivery.accountId.trim()
+    : undefined;
+
+  if (mode === 'announce' && !channel) {
+    return { mode: 'none' };
+  }
+
+  return {
+    mode,
+    ...(channel ? { channel } : {}),
+    ...(to ? { to } : {}),
+    ...(accountId ? { accountId } : {}),
+  };
+}
+
+function normalizeCronDeliveryPatch(rawDelivery: unknown): Record<string, unknown> {
+  if (!rawDelivery || typeof rawDelivery !== 'object') {
+    return {};
+  }
+
+  const delivery = rawDelivery as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  if ('mode' in delivery) {
+    patch.mode = typeof delivery.mode === 'string' && delivery.mode.trim()
+      ? delivery.mode.trim()
+      : 'none';
+  }
+  if ('channel' in delivery) {
+    patch.channel = typeof delivery.channel === 'string' && delivery.channel.trim()
+      ? toOpenClawChannelType(delivery.channel.trim())
+      : '';
+  }
+  if ('to' in delivery) {
+    patch.to = typeof delivery.to === 'string' ? delivery.to : '';
+  }
+  if ('accountId' in delivery) {
+    patch.accountId = typeof delivery.accountId === 'string' ? delivery.accountId : '';
+  }
+  return patch;
+}
+
+function buildCronUpdatePatch(input: Record<string, unknown>): Record<string, unknown> {
+  const patch = { ...input };
+
+  if (typeof patch.schedule === 'string') {
+    patch.schedule = { kind: 'cron', expr: patch.schedule };
+  }
+
+  if (typeof patch.message === 'string') {
+    patch.payload = { kind: 'agentTurn', message: patch.message };
+    delete patch.message;
+  }
+
+  if ('delivery' in patch) {
+    patch.delivery = normalizeCronDeliveryPatch(patch.delivery);
+  }
+
+  return patch;
+}
+
 /**
  * Transform a Gateway CronJob to the frontend CronJob format
  */
 function transformCronJob(job: GatewayCronJob) {
   // Extract message from payload
   const message = job.payload?.message || job.payload?.text || '';
+  const gatewayDelivery = normalizeCronDelivery(job.delivery);
+  const channelType = gatewayDelivery.channel ? toUiChannelType(gatewayDelivery.channel) : undefined;
+  const delivery = channelType
+    ? { ...gatewayDelivery, channel: channelType }
+    : gatewayDelivery;
 
   // Build target from delivery info — only if a delivery channel is specified
-  const channelType = job.delivery?.channel;
   const target = channelType
-    ? { channelType, channelId: channelType, channelName: channelType }
+    ? { channelType, channelId: delivery.accountId || gatewayDelivery.channel, channelName: channelType, recipient: delivery.to }
     : undefined;
 
   // Build lastRun from state
@@ -857,6 +871,7 @@ function transformCronJob(job: GatewayCronJob) {
     name: job.name,
     message,
     schedule: job.schedule, // Pass the object through; frontend parseCronSchedule handles it
+    delivery,
     target,
     enabled: job.enabled,
     createdAt: new Date(job.createdAtMs).toISOString(),
@@ -878,8 +893,7 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
   ipcMain.handle('cron:list', async () => {
     try {
       const result = await gatewayManager.rpc('cron.list', { includeDisabled: true });
-      const data = result as { jobs?: GatewayCronJob[] };
-      const jobs = data?.jobs ?? [];
+      const jobs = Array.isArray(result) ? result : (result as { jobs?: GatewayCronJob[] })?.jobs ?? [];
 
       // Auto-repair legacy UI-created jobs that were saved without
       // delivery: { mode: 'none' }.  The Gateway auto-normalizes them
@@ -928,6 +942,7 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
     name: string;
     message: string;
     schedule: string;
+    delivery?: GatewayCronDelivery;
     enabled?: boolean;
   }) => {
     try {
@@ -942,8 +957,12 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
         // not external messaging channels.  Setting mode='none' prevents
         // the Gateway from attempting channel delivery (which would fail
         // with "Channel is required" when no channels are configured).
-        delivery: { mode: 'none' },
+        delivery: normalizeCronDelivery(input.delivery),
       };
+      const unsupportedDeliveryError = getUnsupportedCronDeliveryError(gatewayInput.delivery.channel);
+      if (gatewayInput.delivery.mode === 'announce' && unsupportedDeliveryError) {
+        throw new Error(unsupportedDeliveryError);
+      }
       const result = await gatewayManager.rpc('cron.add', gatewayInput);
       // Transform the returned job to frontend format
       if (result && typeof result === 'object') {
@@ -959,18 +978,22 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
   // Update an existing cron job
   ipcMain.handle('cron:update', async (_, id: string, input: Record<string, unknown>) => {
     try {
-      // Transform schedule string to CronSchedule object if present
-      const patch = { ...input };
-      if (typeof patch.schedule === 'string') {
-        patch.schedule = { kind: 'cron', expr: patch.schedule };
-      }
-      // Transform message to payload format if present
-      if (typeof patch.message === 'string') {
-        patch.payload = { kind: 'agentTurn', message: patch.message };
-        delete patch.message;
+      const patch = buildCronUpdatePatch(input);
+      const deliveryPatch = patch.delivery && typeof patch.delivery === 'object'
+        ? patch.delivery as Record<string, unknown>
+        : undefined;
+      const deliveryChannel = typeof deliveryPatch?.channel === 'string' && deliveryPatch.channel.trim()
+        ? deliveryPatch.channel.trim()
+        : undefined;
+      const deliveryMode = typeof deliveryPatch?.mode === 'string' && deliveryPatch.mode.trim()
+        ? deliveryPatch.mode.trim()
+        : undefined;
+      const unsupportedDeliveryError = getUnsupportedCronDeliveryError(deliveryChannel);
+      if (unsupportedDeliveryError && deliveryMode !== 'none') {
+        throw new Error(unsupportedDeliveryError);
       }
       const result = await gatewayManager.rpc('cron.update', { id, patch });
-      return result;
+      return result && typeof result === 'object' ? transformCronJob(result as GatewayCronJob) : result;
     } catch (error) {
       console.error('Failed to update cron job:', error);
       throw error;
@@ -1009,6 +1032,65 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
       throw error;
     }
   });
+
+  // Periodic cron job repair: checks for jobs with undefined agentId and repairs them
+  // This handles cases where cron jobs were created via openclaw CLI without specifying agent
+  const CRON_AGENT_REPAIR_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+  let _lastRepairErrorLogAt = 0;
+  const REPAIR_ERROR_LOG_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+  setInterval(async () => {
+    try {
+      const status = gatewayManager.getStatus();
+      if (status.state !== 'running') return;
+
+      const result = await gatewayManager.rpc('cron.list', { includeDisabled: true });
+      const jobs = Array.isArray(result)
+        ? result
+        : (result as { jobs?: Array<{ id: string; name: string; sessionTarget?: string; payload?: { kind: string }; delivery?: { mode: string; channel?: string; to?: string; accountId?: string }; state?: Record<string, unknown> }> })?.jobs ?? [];
+
+      for (const job of jobs) {
+        const jobAgentId = (job as unknown as { agentId?: string }).agentId;
+        if (
+          (job.sessionTarget === 'isolated' || !job.sessionTarget) &&
+          job.payload?.kind === 'agentTurn' &&
+          job.delivery?.mode === 'announce' &&
+          job.delivery?.channel &&
+          jobAgentId === undefined
+        ) {
+          const channel = job.delivery.channel;
+          const accountId = job.delivery.accountId;
+          const toAddress = job.delivery.to;
+
+          let correctAgentId = await resolveAgentIdFromChannel(channel, accountId);
+
+          // If no accountId, try to resolve it from session history
+          let resolvedAccountId: string | null = null;
+          if (!correctAgentId && !accountId && toAddress) {
+            resolvedAccountId = await resolveAccountIdFromSessionHistory(toAddress, channel);
+            if (resolvedAccountId) {
+              correctAgentId = await resolveAgentIdFromChannel(channel, resolvedAccountId);
+            }
+          }
+
+          if (correctAgentId) {
+            console.debug(`Periodic repair: job "${job.name}" agentId undefined -> "${correctAgentId}"`);
+            // When accountId was resolved via to address, include it in the patch
+            const patch: Record<string, unknown> = { agentId: correctAgentId };
+            if (resolvedAccountId && !accountId) {
+              patch.delivery = { accountId: resolvedAccountId };
+            }
+            await gatewayManager.rpc('cron.update', { id: job.id, patch });
+          }
+        }
+      }
+    } catch (error) {
+      const now = Date.now();
+      if (now - _lastRepairErrorLogAt >= REPAIR_ERROR_LOG_INTERVAL_MS) {
+        _lastRepairErrorLogAt = now;
+        console.debug('Periodic cron repair error:', error);
+      }
+    }
+  }, CRON_AGENT_REPAIR_INTERVAL_MS);
 }
 
 /**
@@ -1129,6 +1211,7 @@ function registerGatewayHandlers(
       const result = await gatewayManager.rpc(method, params, timeoutMs);
       return { success: true, result };
     } catch (error) {
+      logger.warn(`[gateway:rpc] ${method} failed (timeoutMs=${timeoutMs ?? 30000}): ${String(error)}`);
       return { success: false, error: String(error) };
     }
   });
@@ -1361,14 +1444,15 @@ function registerGatewayHandlers(
  * For checking package status and channel configuration
  */
 function registerOpenClawHandlers(gatewayManager: GatewayManager): void {
-  // Keep reload-first for feishu to avoid restart storms when channel auth/network is flaky.
-  // GatewayManager.reload() already falls back to restart when reload is unhealthy.
-  const forceRestartChannels = new Set(['dingtalk', 'wecom', 'whatsapp']);
+  // Plugin-based channels require a full Gateway process restart to properly
+  // initialize / tear-down plugin connections.  SIGUSR1 in-process reload is
+  // not sufficient for channel plugins (see restartGatewayForAgentDeletion).
+  const forceRestartChannels = new Set(['dingtalk', 'wecom', 'whatsapp', 'feishu', 'qqbot']);
 
   const scheduleGatewayChannelRestart = (reason: string): void => {
     if (gatewayManager.getStatus().state !== 'stopped') {
       logger.info(`Scheduling Gateway restart after ${reason}`);
-      gatewayManager.debouncedRestart();
+      gatewayManager.debouncedRestart(150);
     } else {
       logger.info(`Gateway is stopped; skip immediate restart after ${reason}`);
     }
@@ -1381,11 +1465,11 @@ function registerOpenClawHandlers(gatewayManager: GatewayManager): void {
     }
     if (forceRestartChannels.has(channelType)) {
       logger.info(`Scheduling Gateway restart after ${reason}`);
-      gatewayManager.debouncedRestart();
+      gatewayManager.debouncedRestart(150);
       return;
     }
     logger.info(`Scheduling Gateway reload after ${reason}`);
-    gatewayManager.debouncedReload();
+    gatewayManager.debouncedReload(150);
   };
 
   // Get OpenClaw package status
@@ -1473,22 +1557,7 @@ function registerOpenClawHandlers(gatewayManager: GatewayManager): void {
           warning: installResult.warning,
         };
       }
-      if (channelType === 'qqbot') {
-        const installResult = await ensureQQBotPluginInstalled();
-        if (!installResult.installed) {
-          return {
-            success: false,
-            error: installResult.warning || 'QQ Bot plugin install failed',
-          };
-        }
-        await saveChannelConfig(channelType, config);
-        scheduleGatewayChannelSaveRefresh(channelType, `channel:saveConfig (${channelType})`);
-        return {
-          success: true,
-          pluginInstalled: installResult.installed,
-          warning: installResult.warning,
-        };
-      }
+      // QQBot is a built-in channel since OpenClaw 3.31 — no plugin install needed
       if (channelType === 'feishu') {
         const installResult = await ensureFeishuPluginInstalled();
         if (!installResult.installed) {
@@ -2120,6 +2189,7 @@ function registerAppHandlers(): void {
 function registerSettingsHandlers(gatewayManager: GatewayManager): void {
   const handleProxySettingsChange = async () => {
     const settings = await getAllSettings();
+    await syncProxyConfigToOpenClaw(settings, { preserveExistingWhenDisabled: false });
     await applyProxySettings(settings);
     if (gatewayManager.getStatus().state === 'running') {
       await gatewayManager.restart();
@@ -2194,7 +2264,7 @@ function registerUsageHandlers(): void {
   });
 }
 /**
- * Window control handlers (for custom title bar on Windows/Linux)
+ * Window control handlers (for custom title bar on Windows)
  */
 function registerWindowHandlers(mainWindow: BrowserWindow): void {
   ipcMain.handle('window:minimize', () => {

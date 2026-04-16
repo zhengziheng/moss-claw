@@ -16,12 +16,14 @@ import {
   getPrimaryChannels,
   type ChannelType,
 } from '@/types/channel';
+import { usesPluginManagedQrAccounts } from '@/lib/channel-alias';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 
 import telegramIcon from '@/assets/channels/telegram.svg';
 import discordIcon from '@/assets/channels/discord.svg';
 import whatsappIcon from '@/assets/channels/whatsapp.svg';
+import wechatIcon from '@/assets/channels/wechat.svg';
 import dingtalkIcon from '@/assets/channels/dingtalk.svg';
 import feishuIcon from '@/assets/channels/feishu.svg';
 import wecomIcon from '@/assets/channels/wecom.svg';
@@ -87,15 +89,53 @@ export function Channels() {
   const [existingAccountIdsForModal, setExistingAccountIdsForModal] = useState<string[]>([]);
   const [initialConfigValuesForModal, setInitialConfigValuesForModal] = useState<Record<string, string> | undefined>(undefined);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  const convergenceRefreshTimersRef = useRef<number[]>([]);
+  const fetchInFlightRef = useRef(false);
+  const queuedFetchOptionsRef = useRef<{ probe?: boolean } | null>(null);
 
   const displayedChannelTypes = getPrimaryChannels();
+  const visibleChannelGroups = channelGroups;
+  const visibleAgents = agents;
+  const hasStableValue = visibleChannelGroups.length > 0 || visibleAgents.length > 0;
+  const isUsingStableValue = hasStableValue && (loading || Boolean(error));
 
-  const fetchPageData = useCallback(async () => {
-    setLoading(true);
+  // Use refs to read current state inside fetchPageData without making it
+  // a dependency — keeps the callback reference stable across renders so
+  // downstream useEffects don't re-execute every time data changes.
+  const channelGroupsRef = useRef(channelGroups);
+  channelGroupsRef.current = channelGroups;
+  const agentsRef = useRef(agents);
+  agentsRef.current = agents;
+
+  const mergeFetchOptions = (
+    base: { probe?: boolean } | null,
+    incoming: { probe?: boolean } | undefined,
+  ): { probe?: boolean } => {
+    return {
+      probe: Boolean(base?.probe) || Boolean(incoming?.probe),
+    };
+  };
+
+  const fetchPageData = useCallback(async (options?: { probe?: boolean }) => {
+    if (fetchInFlightRef.current) {
+      queuedFetchOptionsRef.current = mergeFetchOptions(queuedFetchOptionsRef.current, options);
+      return;
+    }
+    fetchInFlightRef.current = true;
+    const startedAt = Date.now();
+    const probe = options?.probe === true;
+    console.info(`[channels-ui] fetch start probe=${probe ? '1' : '0'}`);
+    // Only show loading spinner on first load (stale-while-revalidate).
+    const hasData = channelGroupsRef.current.length > 0 || agentsRef.current.length > 0;
+    if (!hasData) {
+      setLoading(true);
+    }
     setError(null);
     try {
       const [channelsRes, agentsRes] = await Promise.all([
-        hostApiFetch<{ success: boolean; channels?: ChannelGroupItem[]; error?: string }>('/api/channels/accounts'),
+        hostApiFetch<{ success: boolean; channels?: ChannelGroupItem[]; error?: string }>(
+          options?.probe ? '/api/channels/accounts?probe=1' : '/api/channels/accounts'
+        ),
         hostApiFetch<{ success: boolean; agents?: AgentItem[]; error?: string }>('/api/agents'),
       ]);
 
@@ -109,24 +149,89 @@ export function Channels() {
 
       setChannelGroups(channelsRes.channels || []);
       setAgents(agentsRes.agents || []);
+      console.info(
+        `[channels-ui] fetch ok probe=${probe ? '1' : '0'} elapsedMs=${Date.now() - startedAt} view=${(channelsRes.channels || []).map((item) => `${item.channelType}:${item.status}`).join(',')}`
+      );
     } catch (fetchError) {
+      // Preserve previous data on error — don't clear channelGroups/agents.
       setError(String(fetchError));
+      console.warn(
+        `[channels-ui] fetch fail probe=${probe ? '1' : '0'} elapsedMs=${Date.now() - startedAt} error=${String(fetchError)}`
+      );
     } finally {
+      fetchInFlightRef.current = false;
       setLoading(false);
+      const queued = queuedFetchOptionsRef.current;
+      if (queued) {
+        queuedFetchOptionsRef.current = null;
+        void fetchPageData(queued);
+      }
     }
+  // Stable reference — reads state via refs, no deps needed.
+   
   }, []);
+
+  const clearConvergenceRefreshTimers = useCallback(() => {
+    convergenceRefreshTimersRef.current.forEach((timerId) => {
+      window.clearTimeout(timerId);
+    });
+    convergenceRefreshTimersRef.current = [];
+  }, []);
+
+  const scheduleConvergenceRefresh = useCallback(() => {
+    clearConvergenceRefreshTimers();
+    // Channel adapters can take time to reconnect after gateway restart.
+    // First few rounds use probe=true to force runtime connectivity checks,
+    // then fall back to cached pulls to reduce load.
+    [
+      { delay: 1200, probe: true },
+      { delay: 2600, probe: false },
+      { delay: 4500, probe: false },
+      { delay: 7000, probe: false },
+      { delay: 10500, probe: false },
+    ].forEach(({ delay, probe }) => {
+      const timerId = window.setTimeout(() => {
+        void fetchPageData({ probe });
+      }, delay);
+      convergenceRefreshTimersRef.current.push(timerId);
+    });
+  }, [clearConvergenceRefreshTimers, fetchPageData]);
 
   useEffect(() => {
     void fetchPageData();
   }, [fetchPageData]);
 
   useEffect(() => {
+    return () => {
+      clearConvergenceRefreshTimers();
+    };
+  }, [clearConvergenceRefreshTimers]);
+
+  useEffect(() => {
+    // Throttle channel-status events to avoid flooding fetchPageData during AI tasks.
+    let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+    let pending = false;
+
     const unsubscribe = subscribeHostEvent('gateway:channel-status', () => {
+      if (throttleTimer) {
+        pending = true;
+        return;
+      }
       void fetchPageData();
+      throttleTimer = setTimeout(() => {
+        throttleTimer = null;
+        if (pending) {
+          pending = false;
+          void fetchPageData();
+        }
+      }, 2000);
     });
     return () => {
       if (typeof unsubscribe === 'function') {
         unsubscribe();
+      }
+      if (throttleTimer) {
+        clearTimeout(throttleTimer);
       }
     };
   }, [fetchPageData]);
@@ -137,30 +242,31 @@ export function Channels() {
 
     if (previousGatewayState !== 'running' && gatewayStatus.state === 'running') {
       void fetchPageData();
+      scheduleConvergenceRefresh();
     }
-  }, [fetchPageData, gatewayStatus.state]);
+  }, [fetchPageData, gatewayStatus.state, scheduleConvergenceRefresh]);
 
   const configuredTypes = useMemo(
-    () => channelGroups.map((group) => group.channelType),
-    [channelGroups],
+    () => visibleChannelGroups.map((group) => group.channelType),
+    [visibleChannelGroups],
   );
 
   const groupedByType = useMemo(() => {
-    return Object.fromEntries(channelGroups.map((group) => [group.channelType, group]));
-  }, [channelGroups]);
+    return Object.fromEntries(visibleChannelGroups.map((group) => [group.channelType, group]));
+  }, [visibleChannelGroups]);
 
   const configuredGroups = useMemo(() => {
     const known = displayedChannelTypes
       .map((type) => groupedByType[type])
       .filter((group): group is ChannelGroupItem => Boolean(group));
-    const unknown = channelGroups.filter((group) => !displayedChannelTypes.includes(group.channelType as ChannelType));
+    const unknown = visibleChannelGroups.filter((group) => !displayedChannelTypes.includes(group.channelType as ChannelType));
     return [...known, ...unknown];
-  }, [channelGroups, displayedChannelTypes, groupedByType]);
+  }, [visibleChannelGroups, displayedChannelTypes, groupedByType]);
 
   const unsupportedGroups = displayedChannelTypes.filter((type) => !configuredTypes.includes(type));
 
   const handleRefresh = () => {
-    void fetchPageData();
+    void fetchPageData({ probe: true });
   };
 
   const handleBindAgent = async (channelType: string, accountId: string, agentId: string) => {
@@ -215,7 +321,7 @@ export function Channels() {
     return nextAccountId;
   };
 
-  if (loading) {
+  if (loading && !hasStableValue) {
     return (
       <div className="flex flex-col -m-6 dark:bg-background min-h-[calc(100vh-2.5rem)] items-center justify-center">
         <LoadingSpinner size="lg" />
@@ -224,7 +330,7 @@ export function Channels() {
   }
 
   return (
-    <div className="flex flex-col -m-6 dark:bg-background h-[calc(100vh-2.5rem)] overflow-hidden">
+    <div data-testid="channels-page" className="flex flex-col -m-6 dark:bg-background h-[calc(100vh-2.5rem)] overflow-hidden">
       <div className="w-full max-w-5xl mx-auto flex flex-col h-full p-10 pt-16">
         <div className="flex flex-col md:flex-row md:items-start justify-between mb-12 shrink-0 gap-4">
           <div>
@@ -243,7 +349,7 @@ export function Channels() {
               disabled={gatewayStatus.state !== 'running'}
               className="h-9 text-[13px] font-medium rounded-full px-4 border-black/10 dark:border-white/10 bg-transparent hover:bg-black/5 dark:hover:bg-white/5 shadow-none text-foreground/80 hover:text-foreground transition-colors"
             >
-              <RefreshCw className="h-3.5 w-3.5 mr-2" />
+              <RefreshCw className={cn('h-3.5 w-3.5 mr-2', isUsingStableValue && 'animate-spin')} />
               {t('refresh')}
             </Button>
           </div>
@@ -307,14 +413,17 @@ export function Channels() {
                           variant="outline"
                           className="h-8 text-xs rounded-full"
                           onClick={() => {
-                            const nextAccountId = createNewAccountId(
-                              group.channelType,
-                              group.accounts.map((item) => item.accountId),
-                            );
+                            const shouldUseGeneratedAccountId = !usesPluginManagedQrAccounts(group.channelType);
+                            const nextAccountId = shouldUseGeneratedAccountId
+                              ? createNewAccountId(
+                                group.channelType,
+                                group.accounts.map((item) => item.accountId),
+                              )
+                              : undefined;
                             setSelectedChannelType(group.channelType as ChannelType);
                             setSelectedAccountId(nextAccountId);
                             setAllowExistingConfigInModal(false);
-                            setAllowEditAccountIdInModal(true);
+                            setAllowEditAccountIdInModal(shouldUseGeneratedAccountId);
                             setExistingAccountIdsForModal(group.accounts.map((item) => item.accountId));
                             setInitialConfigValuesForModal(undefined);
                             setShowConfigModal(true);
@@ -363,7 +472,7 @@ export function Channels() {
                                 }}
                               >
                                 <option value="">{t('account.unassigned')}</option>
-                                {agents.map((agent) => (
+                                {visibleAgents.map((agent) => (
                                   <option key={agent.id} value={agent.id}>{agent.name}</option>
                                 ))}
                               </select>
@@ -483,7 +592,8 @@ export function Channels() {
             setInitialConfigValuesForModal(undefined);
           }}
           onChannelSaved={async () => {
-            await fetchPageData();
+            await fetchPageData({ probe: true });
+            scheduleConvergenceRefresh();
             setShowConfigModal(false);
             setSelectedChannelType(null);
             setSelectedAccountId(undefined);
@@ -519,6 +629,8 @@ function ChannelLogo({ type }: { type: ChannelType }) {
       return <img src={discordIcon} alt="Discord" className="w-[22px] h-[22px] dark:invert" />;
     case 'whatsapp':
       return <img src={whatsappIcon} alt="WhatsApp" className="w-[22px] h-[22px] dark:invert" />;
+    case 'wechat':
+      return <img src={wechatIcon} alt="WeChat" className="w-[22px] h-[22px] dark:invert" />;
     case 'dingtalk':
       return <img src={dingtalkIcon} alt="DingTalk" className="w-[22px] h-[22px] dark:invert" />;
     case 'feishu':
