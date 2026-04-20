@@ -43,6 +43,7 @@ import { deviceOAuthManager } from '../utils/device-oauth';
 import { browserOAuthManager } from '../utils/browser-oauth';
 import { whatsAppLoginManager } from '../utils/whatsapp-login';
 import { syncAllProviderAuthToRuntime } from '../services/providers/provider-runtime-sync';
+import { getClawXProviderStore } from "../services/providers/store-instance"
 
 const WINDOWS_APP_USER_MODEL_ID = 'app.clawx.desktop';
 const isE2EMode = process.env.CLAWX_E2E === '1';
@@ -268,6 +269,47 @@ function createMainWindow(): BrowserWindow {
   });
 
   mainWindow = win;
+
+  // Inject a "返回登录" (Back to Login) button on the SSO page.
+  // The SSO page loads via a full-window navigation (location.href),
+  // so the React app is unloaded. This injects a floating button that
+  // lets users return to the login form without completing SSO.
+  const SSO_URL_PREFIX = 'https://ai.web.guosen.com.cn/sso/';
+
+  win.webContents.on('did-finish-load', () => {
+    const url = win.webContents.getURL();
+    if (url.startsWith(SSO_URL_PREFIX)) {
+      win.webContents
+        .executeJavaScript(
+          `
+        (function() {
+          if (document.getElementById('__clawx-back-btn')) return;
+          var btn = document.createElement('button');
+          btn.id = '__clawx-back-btn';
+          btn.textContent = '\\u2039';
+          btn.title = '\\u8fd4\\u56de\\u767b\\u5f55';
+          btn.style.cssText = 'position:fixed;top:50px;left:16px;z-index:999999;width:36px;height:36px;border-radius:6px;background:#fff;color:#333;border:1px solid #d9d9d9;cursor:pointer;font-size:24px;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.08);';
+          btn.addEventListener('mouseenter', function() { btn.style.borderColor = '#7657FF'; btn.style.color = '#7657FF'; });
+          btn.addEventListener('mouseleave', function() { btn.style.borderColor = '#d9d9d9'; btn.style.color = '#333'; });
+          btn.addEventListener('click', function() {
+            if (window.electron && window.electron.ipcRenderer) {
+              window.electron.ipcRenderer.invoke('show-login');
+            }
+          });
+          if (document.body) {
+            document.body.appendChild(btn);
+          } else {
+            document.addEventListener('DOMContentLoaded', function() {
+              document.body && document.body.appendChild(btn);
+            });
+          }
+        })();
+      `
+        )
+        .catch(() => {});
+    }
+  });
+
   return win;
 }
 
@@ -307,11 +349,13 @@ async function initialize(): Promise<void> {
     createTray(window);
   }
 
+  const store = await getClawXProviderStore();
+
   // Override security headers ONLY for the OpenClaw Gateway Control UI.
   // The URL filter ensures this callback only fires for gateway requests,
   // avoiding unnecessary overhead on every other HTTP response.
   session.defaultSession.webRequest.onHeadersReceived(
-    { urls: ['http://127.0.0.1:18789/*', 'http://localhost:18789/*'] },
+    { urls: ['http://127.0.0.1:18789/*', 'http://localhost:18789/*', 'https://ai.web.guosen.com.cn/*'] },
     (details, callback) => {
       const headers = { ...details.responseHeaders };
       delete headers['X-Frame-Options'];
@@ -326,8 +370,43 @@ async function initialize(): Promise<void> {
           (csp) => csp.replace(/frame-ancestors\s+'none'/g, "frame-ancestors 'self' *")
         );
       }
+      if (headers && headers['set-cookie']) {
+        let cookie = "";
+        const cookies =  headers['set-cookie']
+        // StoreService.configStore.delete("loginCookie");
+        for (let i = 0; i < cookies.length; i++) {
+          cookie += headers["set-cookie"][i];
+        }
+        for (let i = 0; i < cookies.length; i++) {
+          headers["set-cookie"][i] +=
+            ";SameSite=None;Secure;partitioned";
+        }
+        store.set("loginCookie", cookie);
+      }
+      // iframe sso
+      if (headers && headers["set-cookie"]) {
+        if (!Array.isArray(headers["Set-Cookie"])) {
+          headers["Set-Cookie"] = [];
+        }
+        headers["set-cookie"].reduce((acc, cookie) => {
+          acc.push(`${cookie}; SameSite=None; Secure`);
+          return acc;
+        }, headers["Set-Cookie"]);
+      }
       callback({ responseHeaders: headers });
     },
+  );
+
+  const filter = { urls: [] };
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    filter,
+    (details, callback) => {
+      if (details.requestHeaders && !details.requestHeaders["Cookie"]) {
+        const cookie = store.get("loginCookie");
+        details.requestHeaders!["Cookie"] = cookie as string;
+      }
+      callback({ requestHeaders: details.requestHeaders });
+    }
   );
 
   // Register IPC handlers

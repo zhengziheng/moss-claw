@@ -9,6 +9,7 @@
 export const PROVIDER_TYPES = [
   'aihub-dev',
   'aihub-prd',
+  'qwen-portal',
   'anthropic',
   'openai',
   'google',
