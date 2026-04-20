@@ -137,6 +137,11 @@ const electronAPI = {
         'openclaw:getConfigDir',
         'openclaw:getSkillsDir',
         'openclaw:getCliCommand',
+         // User session
+        'user:setUserId',
+        'user:getUserId',
+        'user:clear',
+        'user:isLoggedIn',
         // login
         'show-login',
       ];

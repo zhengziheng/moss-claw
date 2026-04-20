@@ -3,6 +3,7 @@
  * Manages authentication state in memory only (no persistence)
  */
 import { create } from 'zustand';
+import { setUserId } from '../hooks/useUserSession';
 
 interface UserInfo {
   id: string;
@@ -117,6 +118,7 @@ export const useAuthStore = create<AuthState>((set) => ({
         userInfo: data.data,
         username: data.data.userName || null,
       });
+      setUserId(data.data.userAccount).catch(console.error);
     } else {
       throw new Error(data.message || 'Failed to fetch user info');
     }
