@@ -3,7 +3,7 @@
  */
 
 // 重要：必须先导入 window-mock，确保在导入 gs-event-tracker-core 之前 mock window 对象
-// import './window-mock';
+import './window-mock';
 
 import Tracker from './gs-event-tracker-core';
 

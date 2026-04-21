@@ -25,7 +25,7 @@ export { LogLevel };
  * 已上报位置持久化文件路径
  */
 const REPORTED_POSITIONS_FILE = join(
-  process.env.NODE_ENV === 'development' ? tmpdir() : (app.getPath('userData') || tmpdir()),
+  process.env.NODE_ENV === 'development' ? tmpdir() : app.getPath('userData') || tmpdir(),
   'reported-log-positions.json'
 );
 
@@ -84,12 +84,13 @@ export class TrackerLogger {
     sampleRate: 0.1,
     extraFields: {},
     flushIntervalMs: 5000,
-    maxBatchSize: 50
+    maxBatchSize: 50,
   };
 
   private pendingEvents: PendingEvent[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
-  private tracker: { eventLog: (event: string, data: Record<string, unknown>) => void } | null = null;
+  private tracker: { eventLog: (event: string, data: Record<string, unknown>) => void } | null =
+    null;
   private isInitialized = false;
 
   // OpenClaw 日志上报相关
@@ -148,7 +149,9 @@ export class TrackerLogger {
    * 初始化 tracker 实例
    * 需要在渲染进程中调用，传入 tracker 实例
    */
-  initTracker(trackerInstance: { eventLog: (event: string, data: Record<string, unknown>) => void }): void {
+  initTracker(trackerInstance: {
+    eventLog: (event: string, data: Record<string, unknown>) => void;
+  }): void {
     this.tracker = trackerInstance;
     this.isInitialized = true;
     this.loadReportedPositions(); // 加载已上报位置
@@ -280,11 +283,11 @@ export class TrackerLogger {
     try {
       // 获取所有日志文件
       const files = readdirSync(logDir)
-        .filter(f => f.endsWith('.log'))
-        .map(f => ({
+        .filter((f) => f.endsWith('.log'))
+        .map((f) => ({
           name: f,
           path: join(logDir, f),
-          stat: statSync(join(logDir, f))
+          stat: statSync(join(logDir, f)),
         }))
         .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs); // 按修改时间排序，最新的在前
 
@@ -310,7 +313,10 @@ export class TrackerLogger {
       if (!newContent.trim()) return;
 
       // 按行分割，限制行数
-      const lines = newContent.split('\n').filter(line => line.trim()).slice(-maxLines);
+      const lines = newContent
+        .split('\n')
+        .filter((line) => line.trim())
+        .slice(-maxLines);
 
       // 批量上报
       lines.forEach((line, index) => {
@@ -323,19 +329,21 @@ export class TrackerLogger {
             timestamp: logMatch[1],
             level: logMatch[2],
             message: logMatch[3],
-            lineIndex: index
+            lineIndex: index,
           });
         } else {
           this.track('openclaw_log', {
             source: 'openclaw',
             file: latestFile.name,
             message: line,
-            lineIndex: index
+            lineIndex: index,
           });
         }
       });
 
-      logger.debug(`[TrackerLogger] Uploaded ${lines.length} lines from OpenClaw log: ${latestFile.path}`);
+      logger.debug(
+        `[TrackerLogger] Uploaded ${lines.length} lines from OpenClaw log: ${latestFile.path}`
+      );
     } catch (error) {
       logger.debug('[TrackerLogger] Failed to upload OpenClaw logs:', error);
     }
@@ -362,11 +370,7 @@ export class TrackerLogger {
   /**
    * 构建日志事件数据
    */
-  private buildEvent(
-    level: string,
-    message: string,
-    data?: Record<string, unknown>
-  ): LogEvent {
+  private buildEvent(level: string, message: string, data?: Record<string, unknown>): LogEvent {
     const sessionInfo = userSessionManager.getSessionInfo();
     return {
       level,
@@ -375,7 +379,7 @@ export class TrackerLogger {
       process: 'main',
       userId: sessionInfo.userId || undefined,
       ...this.config.extraFields,
-      ...data
+      ...data,
     };
   }
 
@@ -394,12 +398,12 @@ export class TrackerLogger {
       /\bcredential\b/i,
       /\bcookie\b/i,
       /\baccess[_-]?token\b/i,
-      /\brefresh[_-]?token\b/i
+      /\brefresh[_-]?token\b/i,
     ];
     const sanitized: Record<string, unknown> = {};
 
     for (const [key, value] of Object.entries(data)) {
-      const isSensitive = sensitivePatterns.some(pattern => pattern.test(key));
+      const isSensitive = sensitivePatterns.some((pattern) => pattern.test(key));
       if (isSensitive) {
         sanitized[key] = '[REDACTED]';
       } else if (typeof value === 'object' && value !== null) {
@@ -421,7 +425,7 @@ export class TrackerLogger {
     const pendingEvent: PendingEvent = {
       event,
       data: sanitizedData,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     };
 
     this.pendingEvents.push(pendingEvent);
@@ -441,10 +445,13 @@ export class TrackerLogger {
     }
 
     const events = this.pendingEvents.splice(0, this.config.maxBatchSize);
-
+    const sessionInfo = userSessionManager.getSessionInfo();
+    logger.info('[sessionInfo]', sessionInfo);
+    const userId = sessionInfo.userId;
     events.forEach(({ event, data }) => {
       try {
-        this.tracker?.eventLog(event, data);
+        let trackData = { userId, ...data };
+        this.tracker?.eventLog(event, trackData);
       } catch (error) {
         // 上报失败时记录到本地日志，但不影响主流程
         logger.debug('[TrackerLogger] Track failed:', event, error);
@@ -462,9 +469,13 @@ export class TrackerLogger {
 
     // 注意：tracker 的 eventLog 可能是异步的，这里只是尽力而为
     const events = this.pendingEvents.splice(0, this.config.maxBatchSize);
+    const sessionInfo = userSessionManager.getSessionInfo();
+    logger.info('[sessionInfo]', sessionInfo);
+    const userId = sessionInfo.userId;
     events.forEach(({ event, data }) => {
       try {
-        this.tracker?.eventLog(event, data);
+        let trackData = { userId, ...data };
+        this.tracker?.eventLog(event, trackData);
       } catch {
         // 忽略错误
       }
@@ -522,12 +533,13 @@ export class TrackerLogger {
       return;
     }
     // 添加 userId 到事件数据中
-    const sessionInfo = userSessionManager.getSessionInfo();
-    const enrichedData = {
-      userId: sessionInfo.userId || undefined,
-      ...data
-    };
-    this.track(event, enrichedData);
+    // const sessionInfo = userSessionManager.getSessionInfo();
+    // console.log('sessionInfo',sessionInfo);
+    // const enrichedData = {
+    //   userId: sessionInfo.userId || undefined,
+    //   ...data
+    // };
+    this.track(event, data);
   }
 
   /**

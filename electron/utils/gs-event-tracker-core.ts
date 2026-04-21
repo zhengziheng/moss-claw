@@ -2025,7 +2025,7 @@ const xmlHttpRequest = function (url, data) {
   // 将数据转换为 URL 查询参数
   const params = new URLSearchParams(data as Record<string, string>).toString();
   const requestUrl = `${url}${url.includes('?') ? '&' : '?'}${params}`;
-  logger.info('[TrackerLogger] Request url:', requestUrl);
+  // logger.info('[TrackerLogger] Request url:', requestUrl);
 
   axios
     .get(requestUrl, {
