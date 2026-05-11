@@ -11,9 +11,13 @@ import { createTray } from './tray';
 import { createMenu } from './menu';
 
 import { appUpdater, registerUpdateHandlers } from './updater';
-import { logger } from '../utils/logger';
+// import { logger } from '../utils/logger';
 import { warmupNetworkOptimization } from '../utils/uv-env';
 import { initTelemetry } from '../utils/telemetry';
+
+import { logger, LogLevel } from '../utils/logger';
+import { trackerLogger } from '../utils/tracker-logger';
+import tracker from '../utils/tracker';
 
 import { ClawHubService } from '../gateway/clawhub';
 import { extensionRegistry } from '../extensions/registry';
@@ -334,6 +338,20 @@ async function initialize(): Promise<void> {
 
     // Initialize Telemetry early
     await initTelemetry();
+      trackerLogger.initTracker(tracker);
+  trackerLogger.setConfig({
+    enabled: true,
+    minLevel: LogLevel.INFO,
+    sampleRate: 0.1,
+    extraFields: {
+      appVersion: app.getVersion(),
+      platform: process.platform
+    },
+    // 启用 OpenClaw 日志上报
+    enableOpenClawLogUpload: true,
+    openClawLogIntervalMs: 30000, // 30 秒上报一次
+    openClawLogMaxLines: 100 // 每次最多 100 行
+  });
 
     // Apply persisted proxy settings before creating windows or network requests.
     await applyProxySettings();
@@ -677,6 +695,8 @@ if (gotTheLock) {
 
     hostEventBus.closeAll();
     hostApiServer?.close();
+    // Flush and destroy tracker logger
+    trackerLogger.destroy();
     void extensionRegistry.teardownAll();
 
     const stopPromise = gatewayManager.stop().catch((err) => {

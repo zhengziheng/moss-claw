@@ -48,6 +48,8 @@ import { getProviderConfig } from '../utils/provider-registry';
 import { deviceOAuthManager, OAuthProviderType } from '../utils/device-oauth';
 import { browserOAuthManager, type BrowserOAuthProviderType } from '../utils/browser-oauth';
 import { applyProxySettings } from './proxy';
+import { userSessionManager } from '../utils/user-session';
+
 import { syncLaunchAtStartupSettingFromStore } from './launch-at-startup';
 import { proxyAwareFetch } from '../utils/proxy-fetch';
 import { getRecentTokenUsageHistory } from '../utils/token-usage';
@@ -139,7 +141,8 @@ export function registerIpcHandlers(
 
   // File staging handlers (upload/send separation)
   registerFileHandlers();
-
+  // User session handlers
+  registerUserSessionHandlers();
   registerLoginHandlers(mainWindow);
 }
 
@@ -2694,5 +2697,42 @@ function registerLoginHandlers(mainWindow: BrowserWindow) {
     } else {
       mainWindow.loadFile(join(__dirname, '../../dist/index.html'));
     }
+  });
+}
+
+
+/**
+ * User session handlers
+ */
+function registerUserSessionHandlers(): void {
+  // 渲染进程设置 userId
+  ipcMain.handle('user:setUserId', async (_, userId: string) => {
+    try {
+      if (!userId || typeof userId !== 'string') {
+        return { success: false, error: 'Invalid userId' };
+      }
+      userSessionManager.setUserId(userId);
+      logger.info('[user:setUserId] User ID set:', userId);
+      return { success: true };
+    } catch (err) {
+      logger.error('[user:setUserId] Error:', err);
+      return { success: false, error: String(err) };
+    }
+  });
+
+  // 渲染进程获取 userId
+  ipcMain.handle('user:getUserId', async () => {
+    return userSessionManager.getUserId();
+  });
+
+  // 渲染进程清除登录状态
+  ipcMain.handle('user:clear', async () => {
+    userSessionManager.clear();
+    return { success: true };
+  });
+
+  // 渲染进程检查登录状态
+  ipcMain.handle('user:isLoggedIn', async () => {
+    return userSessionManager.isLoggedIn();
   });
 }
